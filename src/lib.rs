@@ -69,6 +69,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 
@@ -78,8 +79,11 @@ use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Event, PlaneType, connector, crtc, plane,
 };
 use gbm::Device as GbmDevice;
+use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use thiserror::Error;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::card::Card;
 use crate::monitor::{MonitorResourceAllocation, MonitorSetupError};
@@ -575,7 +579,48 @@ impl<T> EasyDRM<T> {
         }
 
         if drm_ready {
-            self.handle_drm_events()?;
+            Self::handle_drm_events(&mut self.card, &mut self.monitors)?;
+        }
+        Ok(())
+    }
+    /// Non-blocking version of [[poll_events]]
+    pub async fn poll_events_async(
+        &mut self
+    ) -> Result<(), EasyDRMError> {
+        let drm_sync_fd = self.card.as_raw_fd();
+        let drm_async_fd = AsyncFd::with_interest(drm_sync_fd, Interest::READABLE)?;
+        let uevents_raw_fd = self.uevent_socket.as_ref().map(|s| s.fd.as_raw_fd());
+        unsafe {
+
+            fcntl(drm_sync_fd, F_SETFL, fcntl(drm_sync_fd, F_GETFL)|O_NONBLOCK);
+            if let Some(fd) = uevents_raw_fd {
+                fcntl(fd, F_SETFL, fcntl(fd, F_GETFL)|O_NONBLOCK);
+            }
+        }
+        let uevents_async_fd = 
+            self.uevent_socket.as_ref()
+            .map(|s| AsyncFd::with_interest(s.fd.as_raw_fd(), Interest::READABLE))
+            .transpose()?;
+        tokio::select! {
+            guard = drm_async_fd.readable() => {
+                let mut guard = guard?;
+                if let Ok(r) = guard.try_io(|_fd| {
+                    Self::handle_drm_events(&mut self.card, &mut self.monitors)
+                }) { r? }
+            }
+            
+            _ = async {
+                if let Some(ref uevents_async_fd) = uevents_async_fd {
+                    uevents_async_fd.readable().await
+                } else {
+                    pending().await
+                }
+            } => {
+                if let Some(ue) = self.uevent_socket.as_ref()
+                && ue.drain_hotplug_events().unwrap_or(false) {
+                    self.handle_hotplug()?;
+                }
+            }
         }
         Ok(())
     }
@@ -608,7 +653,7 @@ impl<T> EasyDRM<T> {
     pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
         let mut atomic_req = AtomicModeReq::new();
         // Determine commit flags
-        let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::ALLOW_MODESET;
+        let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::NONBLOCK;
         // Rebuild the set with swapped monitors
         let mut committed = Vec::new();
         for (&connector_id, monitor) in self.monitors.iter_mut() {
@@ -669,16 +714,16 @@ impl<T> EasyDRM<T> {
         }
     }
 
-    fn handle_drm_events(&mut self) -> std::io::Result<()> {
+    fn handle_drm_events(card: &mut Card, monitors: &mut HashMap<connector::Handle, Monitor<T>>) -> std::io::Result<()> {
         // Wait for events from DRM
-        for event in self.card.receive_events()? {
+        for event in card.receive_events()? {
             match event {
                 Event::PageFlip(page_flip_event) => {
                     // Find the monitor that completed the page flip
                     // Set can_render = true for that monitor
                     let crtc_handle = page_flip_event.crtc;
 
-                    for monitor in self.monitors.values_mut() {
+                    for monitor in monitors.values_mut() {
                         if monitor.crtc().handle() == crtc_handle {
                             monitor.set_can_render(true);
                         }

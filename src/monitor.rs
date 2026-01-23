@@ -255,7 +255,6 @@ impl<T> Monitor<T> {
         card: &impl control::Device,
         atomic_req: &mut AtomicModeReq,
     ) -> Result<(), MonitorSetupError> {
-        dbg!(self.connector_id);
         self.gles_context.make_current()?;
         // Flush GL and swap EGL buffers
         // Note: GL functions need to be loaded first with gl::load_with()
