@@ -202,7 +202,7 @@ impl<T> Monitor<T> {
     /// Internal flag indicating if this monitor was drawn to this frame.
     ///
     /// Used by `EasyDRM::swap_buffers()` to determine which monitors need presentation.
-    pub(crate) fn was_drawn(&self) -> bool {
+    pub fn was_drawn(&self) -> bool {
         self.was_drawn
     }
 
