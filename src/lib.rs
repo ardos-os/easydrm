@@ -663,15 +663,17 @@ impl<T> EasyDRM<T> {
                 committed.push(connector_id);
             }
         }
+        let should_commit = !committed.is_empty();
         for connector_id in committed {
             self.mark_fast_group_commit(connector_id);
         }
 
         // Submit atomic commit (queues the page flip, doesn't wait)
-        self.card
-            .atomic_commit(flags, atomic_req)
-            .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?;
-
+        if should_commit {
+            self.card
+                .atomic_commit(flags, atomic_req)
+                .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?;
+        }
         Ok(())
     }
 
