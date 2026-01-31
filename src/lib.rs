@@ -597,7 +597,7 @@ impl<T> EasyDRM<T> {
                 fcntl(fd, F_SETFL, fcntl(fd, F_GETFL)|O_NONBLOCK);
             }
         }
-        let uevents_async_fd = 
+        let uevents_async_fd =
             self.uevent_socket.as_ref()
             .map(|s| AsyncFd::with_interest(s.fd.as_raw_fd(), Interest::READABLE))
             .transpose()?;
@@ -608,7 +608,7 @@ impl<T> EasyDRM<T> {
                     Self::handle_drm_events(&mut self.card, &mut self.monitors)
                 }) { r? }
             }
-            
+
             _ = async {
                 if let Some(ref uevents_async_fd) = uevents_async_fd {
                     uevents_async_fd.readable().await
@@ -653,11 +653,14 @@ impl<T> EasyDRM<T> {
     pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
         let mut atomic_req = AtomicModeReq::new();
         // Determine commit flags
-        let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::NONBLOCK;
+        let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT;
         // Rebuild the set with swapped monitors
         let mut committed = Vec::new();
         for (&connector_id, monitor) in self.monitors.iter_mut() {
             if monitor.was_drawn() {
+            		if monitor.needs_mode_set() {
+              		flags |= AtomicCommitFlags::ALLOW_MODESET;
+              	}
                 monitor.swap_buffers(&self.card, &mut atomic_req)?;
                 monitor.reset_drawn_flag();
                 committed.push(connector_id);
