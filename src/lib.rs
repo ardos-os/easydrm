@@ -652,13 +652,13 @@ impl<T> EasyDRM<T> {
     /// fence hand-off for that monitor.
     pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
         let mut atomic_req = AtomicModeReq::new();
+        let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
         // Determine commit flags
-        let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT;
         // Rebuild the set with swapped monitors
         let mut committed = Vec::new();
         for (&connector_id, monitor) in self.monitors.iter_mut() {
-            if monitor.was_drawn() {
-            		if monitor.needs_mode_set() {
+            if monitor.can_render() && monitor.was_drawn() {
+                if monitor.needs_mode_set() {
               		flags |= AtomicCommitFlags::ALLOW_MODESET;
               	}
                 monitor.swap_buffers(&self.card, &mut atomic_req)?;
