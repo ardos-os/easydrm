@@ -414,7 +414,7 @@ impl<T> Monitor<T> {
 
     /// Creates an EGL fence for GPU->DRM synchronization
     /// Returns (fence_fd, sync_object)
-    fn create_egl_fence(&self) -> Result<(i32, *mut std::ffi::c_void), String> {
+    pub fn create_egl_fence(&self) -> Result<(i32, *mut std::ffi::c_void), String> {
         unsafe {
             // Get EGL bindings from glutin display
             let egl = self.gles_context.display().egl();
