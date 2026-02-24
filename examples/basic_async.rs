@@ -1,12 +1,13 @@
 use std::time::Duration;
+use std::collections::HashMap;
 
-use easydrm::{gl, EasyDRM, MonitorContextCreationRequest};
+use easydrm::{EasyDRM, MonitorContextCreationRequest, gl};
 use rand::Rng;
 use tokio::time::Instant;
 
 // Skia
-use skia_safe::{self as skia, Font, FontMgr, Typeface, gpu::gl::FramebufferInfo};
 use skia::gpu;
+use skia_safe::{self as skia, FontMgr, Typeface, gpu::gl::FramebufferInfo};
 
 /// Per-monitor state (includes Skia GPU objects)
 struct MonitorContext {
@@ -20,16 +21,15 @@ struct MonitorContext {
     fps_last: Instant,
     fps_current: f64,
 
-    // Skia GPU state (per monitor)
-    gr: gpu::DirectContext,
-    surface: skia::Surface,
+    // Skia surfaces are per monitor/per framebuffer.
+    surfaces: HashMap<u32, skia::Surface>,
+    current_fbo: u32,
 
     // Track size so we can recreate the surface if needed
     width: usize,
     height: usize,
     gl: easydrm::gl::Gles2,
     font: Typeface,
-    fontmgr: FontMgr
 }
 
 impl MonitorContext {
@@ -40,26 +40,17 @@ impl MonitorContext {
         // - req.width/height: current surface size
 
         unsafe {
-            let version =
-                std::ffi::CStr::from_ptr(req.gl.GetString(gl::VERSION) as *const i8);
+            let version = std::ffi::CStr::from_ptr(req.gl.GetString(gl::VERSION) as *const i8);
             println!("Monitor initialized with OpenGL version: {:?}", version);
         }
 
-        // Create Skia GL interface using the provided proc loader
-        let interface = gpu::gl::Interface::new_load_with(req.get_proc_address)
-        .expect("Failed to create Skia GL interface");
-
-        let mut gr = gpu::direct_contexts::make_gl(interface, None)
-            .expect("Failed to create Skia DirectContext");
-
-        // Create a Skia surface that targets the currently bound framebuffer
-        let surface = create_skia_surface_for_current_fbo(&mut gr, req.gl, req.width, req.height);
+        let initial_fbo = current_framebuffer(req.gl);
+        let surfaces = HashMap::new();
 
         let mut rng = rand::rng();
-        let mut fontmgr = FontMgr::new();
+        let fontmgr = FontMgr::new();
         let font = fontmgr.match_family("Inter").new_typeface(0).unwrap();
         Self {
-            fontmgr,
             font: font,
             frame_count: 0,
             color_offset: rng.random_range(0.0..1.0),
@@ -69,8 +60,8 @@ impl MonitorContext {
             fps_last: Instant::now(),
             fps_current: 0.0,
 
-            gr,
-            surface,
+            surfaces,
+            current_fbo: initial_fbo,
 
             width: req.width,
             height: req.height,
@@ -94,25 +85,39 @@ impl MonitorContext {
         }
     }
 
-    fn ensure_surface(&mut self, width: usize, height: usize) {
-        if self.width == width && self.height == height {
-            return;
+    fn ensure_surface_for_current_fbo(
+        &mut self,
+        gr: &mut gpu::DirectContext,
+        width: usize,
+        height: usize,
+    ) {
+        if self.width != width || self.height != height {
+            self.width = width;
+            self.height = height;
+            self.surfaces.clear();
         }
-        self.width = width;
-        self.height = height;
 
-        // GL context must be current when recreating this.
-        self.surface = create_skia_surface_for_current_fbo(&mut self.gr, &self.gl, width, height);
+        let fbo = current_framebuffer(&self.gl);
+        self.current_fbo = fbo;
+
+        // GL context must be current when creating this.
+        self.surfaces.entry(fbo).or_insert_with(|| {
+            create_skia_surface_for_fbo(gr, fbo, self.width, self.height)
+        });
     }
 
-    fn draw_fps_overlay(&mut self) {
-        let canvas = self.surface.canvas();
+    fn draw_fps_overlay(&mut self, gr: &mut gpu::DirectContext) {
+        let surface = self
+            .surfaces
+            .get_mut(&self.current_fbo)
+            .expect("Skia surface for current framebuffer must exist");
+        let canvas = surface.canvas();
 
         // Small translucent background box
         let mut bg = skia::Paint::default();
         bg.set_anti_alias(true);
         bg.set_color(skia::Color::from_argb(160, 0, 0, 0));
-        let rect = skia::Rect::from_xywh(12.0, 12.0, 200.0, 48.0);
+        let rect = skia::Rect::from_xywh(12.0, 12.0, 400.0, 48.0);
         canvas.draw_round_rect(rect, 10.0, 10.0, &bg);
 
         // FPS text
@@ -121,19 +126,17 @@ impl MonitorContext {
         paint.set_color(skia::Color::WHITE);
 
         let font = skia::Font::from_typeface(&self.font, 26.);
-        let text = format!("{:.1} FPS", self.fps_current);
+        let text = format!("{:.1} FPS | {}", self.fps_current, self.monitor_name);
         canvas.draw_str(text, (22.0, 46.0), &font, &paint);
 
         // Flush Skia -> GL
-        self.gr.flush_and_submit();
+        gr.flush(None);
     }
 
     fn status(&self) -> String {
         format!(
             "{} | fps={:.1} | total_frames={}",
-            self.monitor_name,
-            self.fps_current,
-            self.frame_count
+            self.monitor_name, self.fps_current, self.frame_count
         )
     }
 }
@@ -143,6 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing EasyDRM...");
 
     let mut easydrm = EasyDRM::init(MonitorContext::new)?;
+    easydrm.make_current()?;
+    let interface = gpu::gl::Interface::new_load_with(|s| easydrm.get_proc_address(s))
+        .expect("Failed to create shared Skia GL interface");
+    let mut gr = gpu::direct_contexts::make_gl(interface, None)
+        .expect("Failed to create shared Skia DirectContext");
 
     println!("EasyDRM initialized successfully!");
     println!("Found {} monitor(s)", easydrm.monitor_count());
@@ -181,10 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if dt > Duration::from_millis(10) {
-                eprintln!(
-                    "[SENTINEL] late tick: {:?} (worst={:?})",
-                    dt, worst
-                );
+                eprintln!("[SENTINEL] late tick: {:?} (worst={:?})", dt, worst);
             }
         }
     });
@@ -196,29 +201,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
 
+
+        
         // Render per monitor
         for monitor in easydrm.monitors_mut() {
             if monitor.can_render() && monitor.make_current().is_ok() {
-
                 // If modes can change, keep the Skia surface size synced with the monitor.
                 // (If you prefer, you can use req.width/height at init and skip this.)
                 let mode = monitor.active_mode();
                 let (w, h) = (mode.size().0 as usize, mode.size().1 as usize);
-                monitor.context_mut().ensure_surface(w, h);
-                // Update per-monitor animation + FPS counter
-                let (r, g, b) = monitor.context_mut().update_and_get_color();
-                monitor.context_mut().maybe_update_fps(now);
+                let gl = monitor.gl().clone();
+                {
+                    let ctx = monitor.context_mut();
+                    ctx.ensure_surface_for_current_fbo(&mut gr, w, h);
+                    // Update per-monitor animation + FPS counter
+                    let (r, g, b) = ctx.update_and_get_color();
+                    ctx.maybe_update_fps(now);
 
-                // GL clear
-                unsafe {
-                    let gl = monitor.gl();
+                    // GL clear
+                    unsafe {
+                        gl.ClearColor(r, g, b, 1.0);
+                        gl.Clear(gl::COLOR_BUFFER_BIT);
+                    }
 
-                    gl.ClearColor(r, g, b, 1.0);
-                    gl.Clear(gl::COLOR_BUFFER_BIT);
+                    // Draw FPS overlay with Skia on top of the GL content
+                    ctx.draw_fps_overlay(&mut gr);
                 }
-
-                // Draw FPS overlay with Skia on top of the GL content
-                monitor.context_mut().draw_fps_overlay();
             }
         }
 
@@ -252,25 +260,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Create a Skia surface that renders into the currently bound GL framebuffer.
 /// NOTE: The GL context for the target monitor must be current when calling this.
-fn create_skia_surface_for_current_fbo(
+fn create_skia_surface_for_fbo(
     gr: &mut gpu::DirectContext,
-    gl: &gl::Gles2,
+    fbo: u32,
     width: usize,
     height: usize,
 ) -> skia::Surface {
-    // Query currently bound framebuffer
-    let mut fbo: i32 = 0;
-    unsafe {
-        // If FRAMEBUFFER_BINDING is not available in your bindings,
-        // try DRAW_FRAMEBUFFER_BINDING instead.
-        gl.GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut fbo);
-    }
-
     let fb_info = FramebufferInfo {
-        fboid: fbo as u32,
+        fboid: fbo,
         // Common default. If your framebuffer format differs, match it here.
         format: gpu::gl::Format::RGBA8.into(),
-        protected: gpu::Protected::No
+        protected: gpu::Protected::No,
     };
 
     let backend_rt = gpu::backend_render_targets::make_gl(
@@ -283,12 +283,22 @@ fn create_skia_surface_for_current_fbo(
     gpu::surfaces::wrap_backend_render_target(
         gr,
         &backend_rt,
-        gpu::SurfaceOrigin::BottomLeft, // GL convention
+        gpu::SurfaceOrigin::TopLeft,
         skia::ColorType::RGBA8888,
         None,
         None,
     )
     .expect("Failed to create Skia Surface from backend render target")
+}
+
+fn current_framebuffer(gl: &gl::Gles2) -> u32 {
+    let mut fbo: i32 = 0;
+    unsafe {
+        // If FRAMEBUFFER_BINDING is not available in your bindings,
+        // try DRAW_FRAMEBUFFER_BINDING instead.
+        gl.GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut fbo);
+    }
+    fbo as u32
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {

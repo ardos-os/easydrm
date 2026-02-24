@@ -1,13 +1,11 @@
-use std::{ffi::CString, num::NonZero, ptr::NonNull};
+use std::{ffi::CString, ptr::NonNull};
 
-use drm::control;
-use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice};
+use gbm::{AsRaw, Device as GbmDevice};
 use glutin::api::egl;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::ContextAttributesBuilder;
 use glutin::prelude::*;
-use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
-use raw_window_handle::{GbmDisplayHandle, GbmWindowHandle, RawDisplayHandle, RawWindowHandle};
+use raw_window_handle::{GbmDisplayHandle, RawDisplayHandle};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,10 +14,6 @@ pub enum GlesContextError {
     DisplayCreationFailed,
     #[error("No suitable EGL config found")]
     NoConfigFound,
-    #[error("Failed to create GBM surface")]
-    GbmSurfaceCreationFailed,
-    #[error("Failed to create EGL surface: {0}")]
-    EglSurfaceCreationFailed(String),
     #[error("Failed to create EGL context: {0}")]
     EglContextCreationFailed(String),
     #[error("Failed to make context current")]
@@ -28,20 +22,14 @@ pub enum GlesContextError {
 
 pub struct GlesContext {
     display: egl::display::Display,
-    surface: egl::surface::Surface<WindowSurface>,
+    _config: egl::config::Config,
     context: egl::context::PossiblyCurrentContext,
-    gbm_surface: gbm::Surface<()>,
     gl: crate::gl::Gles2,
 }
 
 impl GlesContext {
-    /// Creates a new OpenGL ES context for the given monitor mode
-    pub fn new(
-        gbm_device: &GbmDevice<std::fs::File>,
-        mode: &control::Mode,
-    ) -> Result<Self, GlesContextError> {
-        let (width, height) = mode.size();
-
+    /// Creates a shared OpenGL ES context that can be reused across monitor surfaces.
+    pub fn new(gbm_device: &GbmDevice<std::fs::File>) -> Result<Self, GlesContextError> {
         // Create EGL display from GBM device
         let raw_display_handle = RawDisplayHandle::Gbm(GbmDisplayHandle::new(
             NonNull::new(gbm_device.as_raw() as *mut std::ffi::c_void)
@@ -54,46 +42,12 @@ impl GlesContext {
         // Find best EGL config
         let config = find_egl_config(&display)?;
 
-        // Create GBM surface
-        let gbm_surface = gbm_device
-            .create_surface::<()>(
-                width.into(),
-                height.into(),
-                gbm::Format::Xrgb8888,
-                BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-            )
-            .map_err(|_| GlesContextError::GbmSurfaceCreationFailed)?;
-
-        // Create EGL window surface
-        let raw_window_handle = RawWindowHandle::Gbm(GbmWindowHandle::new(
-            NonNull::new(gbm_surface.as_raw() as *mut std::ffi::c_void)
-                .ok_or(GlesContextError::GbmSurfaceCreationFailed)?,
-        ));
-
-        let surface = unsafe {
-            display
-                .create_window_surface(
-                    &config,
-                    &SurfaceAttributesBuilder::<WindowSurface>::new().build(
-                        raw_window_handle,
-                        NonZero::new(width as u32)
-                            .ok_or(GlesContextError::GbmSurfaceCreationFailed)?,
-                        NonZero::new(height as u32)
-                            .ok_or(GlesContextError::GbmSurfaceCreationFailed)?,
-                    ),
-                )
-                .map_err(|e| GlesContextError::EglSurfaceCreationFailed(e.to_string()))?
-        };
-
-        // Create EGL context
+        // Create a surfaceless shared EGL context.
         let context = unsafe {
             display
-                .create_context(
-                    &config,
-                    &ContextAttributesBuilder::new().build(Some(raw_window_handle)),
-                )
+                .create_context(&config, &ContextAttributesBuilder::new().build(None))
                 .map_err(|e| GlesContextError::EglContextCreationFailed(e.to_string()))?
-                .make_current(&surface)
+                .make_current_surfaceless()
                 .map_err(|_| GlesContextError::MakeCurrentFailed)?
         };
 
@@ -105,33 +59,18 @@ impl GlesContext {
 
         Ok(GlesContext {
             display,
-            surface,
+            _config: config,
             context,
-            gbm_surface,
             gl,
         })
     }
 
-    /// Makes this context current for OpenGL operations
-    pub fn make_current(&self) -> Result<(), GlesContextError> {
+    /// Makes the shared context current without a draw/read surface.
+    pub fn make_current_surfaceless(&self) -> Result<(), GlesContextError> {
         self.context
-            .make_current(&self.surface)
+            .make_current_surfaceless()
             .map_err(|_| GlesContextError::MakeCurrentFailed)?;
         Ok(())
-    }
-
-    /// Swaps buffers and returns the new buffer object for presentation
-    pub fn swap_buffers(&mut self) -> Result<gbm::BufferObject<()>, GlesContextError> {
-        // Swap EGL buffers
-        self.surface
-            .swap_buffers(&self.context)
-            .map_err(|_| GlesContextError::MakeCurrentFailed)?;
-
-        // Lock front buffer from GBM surface
-        let bo = unsafe { self.gbm_surface.lock_front_buffer() }
-            .map_err(|_| GlesContextError::GbmSurfaceCreationFailed)?;
-
-        Ok(bo)
     }
 
     /// Gets a function pointer for loading OpenGL functions

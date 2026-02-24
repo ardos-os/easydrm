@@ -1,6 +1,13 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    sync::{Arc, Mutex},
+};
 
-use drm::control::{self, atomic::AtomicModeReq, connector, crtc, plane, property};
+use drm::control::{self, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, plane, property};
+use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice, Format, Modifier};
+use glutin::display::AsRawDisplay;
 use thiserror::Error;
 
 use crate::MonitorContextCreationRequest;
@@ -13,37 +20,28 @@ pub(crate) struct MonitorResourceAllocation {
     pub cursor_plane: Option<plane::Handle>,
 }
 
-/// Represents a connected display monitor with its own OpenGL ES rendering context.
-///
-/// Each monitor manages:
-/// - DRM resources (connector, CRTC, planes)
-/// - Display mode configuration with 3-state tracking
-/// - Independent OpenGL ES context
-/// - Render state tracking
-///
-/// # Display Modes (3-State System)
-///
-/// - **default_mode**: The optimal mode for this monitor (highest resolution + refresh rate)
-///   - e.g., 4K@120Hz for a high-end monitor
-///   - This is the fallback when no custom mode is requested
-/// - **requested_mode**: The mode the user wants to use
-///   - `None` means use the optimal default mode
-///   - `Some(mode)` means use a custom mode (e.g., 1080p@60Hz)
-/// - **current_mode**: The mode currently set in hardware
-///   - `None` if no mode has been set yet (new monitor) or TTY lost focus
-///   - `Some(mode)` is the last mode successfully committed to DRM
-///   - Compared against `requested_mode` each frame to trigger mode sets
-///
-/// # Rendering Flow
-///
-/// ```ignore
-/// if monitor.can_render() {
-///     monitor.make_current()?;
-///     // OpenGL rendering calls here...
-///     gl::Clear(gl::COLOR_BUFFER_BIT);
-/// }
-/// // EasyDRM::swap_buffers() will orchestrate the monitor swaps
-/// ```
+const EGL_NONE: i32 = 0x3038;
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
+const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+const EGL_SYNC_FENCE_KHR: u32 = 0x3144;
+
+struct SwapchainSlot {
+    bo: BufferObject<()>,
+    fbo: u32,
+    texture: u32,
+    egl_image: *mut std::ffi::c_void,
+    drm_fb: Option<control::framebuffer::Handle>,
+}
+
+/// Represents a connected display monitor with a shared surfaceless GL context
+/// and a monitor-local explicit GBM swapchain.
 pub struct Monitor<T> {
     connector_id: connector::Handle,
     current_crtc: crtc::Info,
@@ -52,18 +50,17 @@ pub struct Monitor<T> {
     current_mode: Option<control::Mode>,
     primary_plane_id: plane::Handle,
     cursor_plane_id: Option<plane::Handle>,
-    gles_context: GlesContext,
+    gles_context: Arc<Mutex<GlesContext>>,
+    gbm_device: GbmDevice<std::fs::File>,
+    gl: crate::gl::Gles2,
+    swapchain: [SwapchainSlot; 2],
+    current_slot: usize,
     can_render: bool,
     was_drawn: bool,
-    // DRM state tracking
-    previous_bo: Option<gbm::BufferObject<()>>,
-    previous_fence_fd: Option<i32>,
-    previous_sync: Option<*mut std::ffi::c_void>,
     connector_properties: HashMap<String, property::Info>,
     crtc_properties: HashMap<String, property::Info>,
     plane_properties: HashMap<String, property::Info>,
     first_frame: bool,
-    // User context
     user_context: T,
 }
 
@@ -81,7 +78,6 @@ impl<T> Hash for Monitor<T> {
     }
 }
 
-/// Errors that can occur during monitor initialization
 #[derive(Debug, Error)]
 pub enum MonitorSetupError {
     #[error("IO Error: {0}")]
@@ -100,10 +96,145 @@ pub enum MonitorSetupError {
     DrmError(String),
 }
 
+fn create_slot(
+    ctx: &GlesContext,
+    gl: &crate::gl::Gles2,
+    gbm_device: &GbmDevice<std::fs::File>,
+    mode: &control::Mode,
+) -> Result<SwapchainSlot, MonitorSetupError> {
+    let (width, height) = mode.size();
+    let bo = gbm_device
+        .create_buffer_object::<()>(
+            width.into(),
+            height.into(),
+            Format::Xrgb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .map_err(MonitorSetupError::IOError)?;
+
+    let egl = ctx.display().egl();
+    let fd = bo
+        .fd()
+        .map_err(|_| MonitorSetupError::DrmError("Failed to export BO dmabuf fd".into()))?;
+
+    let mut attrs = vec![
+        EGL_WIDTH,
+        bo.width() as i32,
+        EGL_HEIGHT,
+        bo.height() as i32,
+        EGL_LINUX_DRM_FOURCC_EXT,
+        bo.format() as u32 as i32,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        fd.as_raw_fd(),
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        bo.offset(0) as i32,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        bo.stride() as i32,
+    ];
+    let bo_modifier = bo.modifier();
+    if bo_modifier != Modifier::Invalid {
+        let modifier: u64 = bo_modifier.into();
+        attrs.extend_from_slice(&[
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+            (modifier & 0xFFFF_FFFF) as i32,
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+            ((modifier >> 32) & 0xFFFF_FFFF) as i32,
+        ]);
+    }
+    attrs.push(EGL_NONE);
+
+    let egl_image = unsafe {
+        egl.CreateImageKHR(
+            egl.GetCurrentDisplay(),
+            std::ptr::null_mut(),
+            EGL_LINUX_DMA_BUF_EXT,
+            std::ptr::null(),
+            attrs.as_ptr(),
+        )
+    };
+
+    if egl_image.is_null() {
+        return Err(MonitorSetupError::DrmError(
+            "eglCreateImageKHR failed for monitor swapchain slot".into(),
+        ));
+    }
+
+    let mut texture: u32 = 0;
+    let mut fbo: u32 = 0;
+    unsafe {
+        gl.GenTextures(1, &mut texture);
+        gl.BindTexture(crate::gl::TEXTURE_2D, texture);
+        gl.TexParameteri(
+            crate::gl::TEXTURE_2D,
+            crate::gl::TEXTURE_MIN_FILTER,
+            crate::gl::LINEAR as i32,
+        );
+        gl.TexParameteri(
+            crate::gl::TEXTURE_2D,
+            crate::gl::TEXTURE_MAG_FILTER,
+            crate::gl::LINEAR as i32,
+        );
+        gl.TexParameteri(
+            crate::gl::TEXTURE_2D,
+            crate::gl::TEXTURE_WRAP_S,
+            crate::gl::CLAMP_TO_EDGE as i32,
+        );
+        gl.TexParameteri(
+            crate::gl::TEXTURE_2D,
+            crate::gl::TEXTURE_WRAP_T,
+            crate::gl::CLAMP_TO_EDGE as i32,
+        );
+        gl.EGLImageTargetTexture2DOES(crate::gl::TEXTURE_2D, egl_image.cast());
+        gl.BindTexture(crate::gl::TEXTURE_2D, 0);
+
+        gl.GenFramebuffers(1, &mut fbo);
+        gl.BindFramebuffer(crate::gl::FRAMEBUFFER, fbo);
+        gl.FramebufferTexture2D(
+            crate::gl::FRAMEBUFFER,
+            crate::gl::COLOR_ATTACHMENT0,
+            crate::gl::TEXTURE_2D,
+            texture,
+            0,
+        );
+
+        let status = gl.CheckFramebufferStatus(crate::gl::FRAMEBUFFER);
+        gl.BindFramebuffer(crate::gl::FRAMEBUFFER, 0);
+        if status != crate::gl::FRAMEBUFFER_COMPLETE {
+            return Err(MonitorSetupError::DrmError(format!(
+                "Failed to create framebuffer, status={status:#x}"
+            )));
+        }
+    }
+
+    Ok(SwapchainSlot {
+        bo,
+        fbo,
+        texture,
+        egl_image: egl_image as *mut std::ffi::c_void,
+        drm_fb: None,
+    })
+}
+
+fn destroy_slot(ctx: &GlesContext, gl: &crate::gl::Gles2, slot: &SwapchainSlot) {
+    let egl = ctx.display().egl();
+    unsafe {
+        if slot.fbo != 0 {
+            gl.DeleteFramebuffers(1, &slot.fbo);
+        }
+        if slot.texture != 0 {
+            gl.DeleteTextures(1, &slot.texture);
+        }
+        if !slot.egl_image.is_null() {
+            egl.DestroyImageKHR(egl.GetCurrentDisplay(), slot.egl_image);
+        }
+    }
+}
+
 impl<T> Monitor<T> {
     pub(crate) fn setup<F>(
         card: &impl control::Device,
-        gbm_device: &gbm::Device<std::fs::File>,
+        gbm_device: &GbmDevice<std::fs::File>,
+        shared_gles_context: Arc<Mutex<GlesContext>>,
         connector_id: connector::Handle,
         allocation: MonitorResourceAllocation,
         context_constructor: F,
@@ -117,27 +248,61 @@ impl<T> Monitor<T> {
             primary_plane,
             cursor_plane,
         } = allocation;
-        // Get the optimal/preferred mode (highest resolution + refresh rate)
+
         let default_mode = connector
             .modes()
             .first()
             .cloned()
             .ok_or(MonitorSetupError::NoModesFound)?;
 
-        // Create the OpenGL ES context for this monitor
-        let gles_context = GlesContext::new(gbm_device, &default_mode)?;
+        let gbm_device_clone = {
+            use std::os::fd::FromRawFd;
+            let fd = gbm_device.as_fd().as_raw_fd();
+            let dupfd = unsafe { libc::dup(fd) };
+            if dupfd < 0 {
+                return Err(MonitorSetupError::DrmError("Failed to dup gbm fd".into()));
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(dupfd) };
+            GbmDevice::new(file).map_err(MonitorSetupError::IOError)?
+        };
 
-        // Initialize user context with access to GL bindings
-        let get_proc_address = |symbol: &str| gles_context.get_proc_address(symbol);
+        let gl = {
+            let ctx = shared_gles_context
+                .lock()
+                .map_err(|_| MonitorSetupError::DrmError("Shared GLES context poisoned".into()))?;
+            ctx.gl().clone()
+        };
+
+        let (slot0, slot1) = {
+            let ctx = shared_gles_context
+                .lock()
+                .map_err(|_| MonitorSetupError::DrmError("Shared GLES context poisoned".into()))?;
+            ctx.make_current_surfaceless()?;
+            (
+                create_slot(&ctx, &gl, &gbm_device_clone, &default_mode)?,
+                create_slot(&ctx, &gl, &gbm_device_clone, &default_mode)?,
+            )
+        };
+
+        unsafe {
+            gl.BindFramebuffer(crate::gl::FRAMEBUFFER, slot0.fbo);
+            gl.Viewport(0, 0, slot0.bo.width() as i32, slot0.bo.height() as i32);
+        }
+
+        let get_proc_address = |symbol: &str| {
+            shared_gles_context
+                .lock()
+                .map(|ctx| ctx.get_proc_address(symbol))
+                .unwrap_or(std::ptr::null())
+        };
         let request = MonitorContextCreationRequest {
-            gl: gles_context.gl(),
-            width: default_mode.size().0 as _,
-            height: default_mode.size().1 as _,
+            gl: &gl,
+            width: default_mode.size().0 as usize,
+            height: default_mode.size().1 as usize,
             get_proc_address: &get_proc_address,
         };
         let user_context = context_constructor(&request);
 
-        // Cache DRM properties for atomic commits
         let connector_properties = card
             .get_properties(connector_id)?
             .as_hashmap(card)
@@ -163,16 +328,17 @@ impl<T> Monitor<T> {
             connector_id,
             current_crtc: crtc_info,
             default_mode,
-            requested_mode: None, // Use default mode initially
-            current_mode: None,   // No mode set in hardware yet
+            requested_mode: None,
+            current_mode: None,
             primary_plane_id: primary_plane,
             cursor_plane_id: cursor_plane,
-            gles_context,
-            can_render: true, // Initially ready to render
+            gles_context: shared_gles_context,
+            gbm_device: gbm_device_clone,
+            gl,
+            swapchain: [slot0, slot1],
+            current_slot: 0,
+            can_render: true,
             was_drawn: false,
-            previous_bo: None,
-            previous_fence_fd: None,
-            previous_sync: None,
             connector_properties,
             crtc_properties,
             plane_properties,
@@ -181,120 +347,120 @@ impl<T> Monitor<T> {
         })
     }
 
-    /// Get a reference to the user context
+    fn ensure_swapchain_for_mode(
+        &mut self,
+        card: &impl control::Device,
+        mode: &control::Mode,
+    ) -> Result<(), MonitorSetupError> {
+        let (w, h) = mode.size();
+        if self.swapchain[0].bo.width() == w as u32 && self.swapchain[0].bo.height() == h as u32 {
+            return Ok(());
+        }
+
+        let (new0, new1) = {
+            let ctx = self
+                .gles_context
+                .lock()
+                .map_err(|_| MonitorSetupError::DrmError("Shared GLES context poisoned".into()))?;
+            ctx.make_current_surfaceless()?;
+            (
+                create_slot(&ctx, &self.gl, &self.gbm_device, mode)?,
+                create_slot(&ctx, &self.gl, &self.gbm_device, mode)?,
+            )
+        };
+
+        if let Ok(ctx) = self.gles_context.lock() {
+            let _ = ctx.make_current_surfaceless();
+            for slot in &self.swapchain {
+                if let Some(fb) = slot.drm_fb {
+                    let _ = card.destroy_framebuffer(fb);
+                }
+                destroy_slot(&ctx, &self.gl, slot);
+            }
+        }
+
+        self.swapchain = [new0, new1];
+        self.current_slot = 0;
+        Ok(())
+    }
+
     pub fn context(&self) -> &T {
         &self.user_context
     }
 
-    /// Get a mutable reference to the user context
     pub fn context_mut(&mut self) -> &mut T {
         &mut self.user_context
     }
 
-    /// Returns whether this monitor is ready to be rendered to.
-    ///
-    /// This is updated by `poll_events()` based on page flip completion and VBlank timing.
-    /// Only render to monitors where this returns `true` to avoid frame drops.
     pub fn can_render(&self) -> bool {
         self.can_render
     }
 
-    /// Internal flag indicating if this monitor was drawn to this frame.
-    ///
-    /// Used by `EasyDRM::swap_buffers()` to determine which monitors need presentation.
     pub fn was_drawn(&self) -> bool {
         self.was_drawn
     }
 
-    /// Sets the can_render flag (used by poll_events).
     pub(crate) fn set_can_render(&mut self, value: bool) {
         self.can_render = value;
     }
 
-    /// Resets the was_drawn flag for the next frame (used by EasyDRM::swap_buffers).
     pub(crate) fn reset_drawn_flag(&mut self) {
         self.was_drawn = false;
     }
 
-    /// Makes this monitor's OpenGL context current for rendering.
-    ///
-    /// Call this before any OpenGL rendering operations. Automatically marks
-    /// this monitor as having been drawn to for this frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the EGL context cannot be made current.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// if monitor.can_render() {
-    ///     monitor.make_current()?;
-    ///     gl::ClearColor(0.0, 0.0, 0.0, 1.0);
-    ///     gl::Clear(gl::COLOR_BUFFER_BIT);
-    /// }
-    /// ```
     pub fn make_current(&mut self) -> Result<(), GlesContextError> {
-        self.gles_context.make_current()?;
+        let ctx = self
+            .gles_context
+            .lock()
+            .map_err(|_| GlesContextError::MakeCurrentFailed)?;
+        ctx.make_current_surfaceless()?;
+        let slot = &self.swapchain[self.current_slot];
+        unsafe {
+            self.gl.BindFramebuffer(crate::gl::FRAMEBUFFER, slot.fbo);
+            self.gl
+                .Viewport(0, 0, slot.bo.width() as i32, slot.bo.height() as i32);
+        }
         self.was_drawn = true;
         Ok(())
     }
 
-    /// Swaps buffers and submits an atomic commit to display the rendered content.
-    ///
-    /// This handles:
-    /// - EGL buffer swap
-    /// - Atomic DRM commit with the new framebuffer
-    /// - Mode setting if `requested_mode != current_mode`
-    ///
-    /// **Warning:** This is internal API only. Must be called by `EasyDRM::swap_buffers()`
-    /// with proper timing to avoid tearing or frame drops. Calling this directly can
-    /// cause synchronization issues.
-    pub(crate) fn swap_buffers(
+    pub(crate) fn populate_commit(
         &mut self,
         card: &impl control::Device,
         atomic_req: &mut AtomicModeReq,
+        in_fence_fd: Option<i32>,
     ) -> Result<(), MonitorSetupError> {
-        self.gles_context.make_current()?;
-        // Flush GL and swap EGL buffers
-        // Note: GL functions need to be loaded first with gl::load_with()
-        // This will be called by the user before rendering
+        let target_mode = self
+            .requested_mode
+            .as_ref()
+            .unwrap_or(&self.default_mode)
+            .clone();
+        self.ensure_swapchain_for_mode(card, &target_mode)?;
 
-        // Get the new buffer object from GBM
-        let bo = self
+        let ctx = self
             .gles_context
-            .swap_buffers()
-            .map_err(|e| MonitorSetupError::DrmError(format!("Failed to swap buffers: {}", e)))?;
+            .lock()
+            .map_err(|_| MonitorSetupError::DrmError("Shared GLES context poisoned".into()))?;
+        ctx.make_current_surfaceless()?;
 
-        // Cleanup previous fence and sync object
-        if let Some(old_fence_fd) = self.previous_fence_fd.take() {
-            unsafe {
-                libc::close(old_fence_fd);
-            }
-        }
-        if let Some(old_sync) = self.previous_sync.take() {
-            self.destroy_egl_sync(old_sync);
-        }
+        let slot = &mut self.swapchain[self.current_slot];
+        let fb = if let Some(existing) = slot.drm_fb {
+            existing
+        } else {
+            let flags = if slot.bo.modifier() == Modifier::Invalid {
+                FbCmd2Flags::empty()
+            } else {
+                FbCmd2Flags::MODIFIERS
+            };
+            let created = card.add_planar_framebuffer(&slot.bo, flags).map_err(|e| {
+                MonitorSetupError::DrmError(format!("Failed to add framebuffer: {}", e))
+            })?;
+            slot.drm_fb = Some(created);
+            created
+        };
 
-        // Create EGL fence for GPU->DRM synchronization
-        let (fence_fd, sync) = self
-            .create_egl_fence()
-            .map_err(|e| MonitorSetupError::DrmError(format!("Failed to create fence: {}", e)))?;
-
-        // Create DRM framebuffer from the buffer object
-        // NOTE: Framebuffer will drop automatically after atomic commit (RAII)
-        // We only need to keep the buffer object alive for proper double-buffering
-        let fb = card.add_framebuffer(&bo, 24, 32).map_err(|e| {
-            MonitorSetupError::DrmError(format!("Failed to add framebuffer: {}", e))
-        })?;
-
-        // Build atomic commit request
-
-        // Determine which mode to use
-        let target_mode = self.requested_mode.as_ref().unwrap_or(&self.default_mode);
         let needs_mode_set = self.needs_mode_set();
 
-        // Set connector CRTC_ID
         atomic_req.add_property(
             self.connector_id,
             self.connector_properties["CRTC_ID"].handle(),
@@ -306,10 +472,8 @@ impl<T> Monitor<T> {
             property::Value::CRTC(Some(self.current_crtc.handle())),
         );
 
-        // Configure plane for full-screen scanout
         let (width, height) = target_mode.size();
 
-        // Source rectangle (in 16.16 fixed point)
         atomic_req.add_property(
             self.primary_plane_id,
             self.plane_properties["SRC_X"].handle(),
@@ -331,7 +495,6 @@ impl<T> Monitor<T> {
             property::Value::UnsignedRange((height as u64) << 16),
         );
 
-        // Destination rectangle
         atomic_req.add_property(
             self.primary_plane_id,
             self.plane_properties["CRTC_X"].handle(),
@@ -351,10 +514,10 @@ impl<T> Monitor<T> {
             self.primary_plane_id,
             self.plane_properties["CRTC_H"].handle(),
             property::Value::UnsignedRange(height as u64),
-        ); // If mode set is needed (first frame or mode change)
+        );
+
         if needs_mode_set {
-            // Create mode blob and set MODE_ID
-            let mode_blob = card.create_property_blob(target_mode).map_err(|e| {
+            let mode_blob = card.create_property_blob(&target_mode).map_err(|e| {
                 MonitorSetupError::DrmError(format!("Failed to create mode blob: {}", e))
             })?;
             atomic_req.add_property(
@@ -362,8 +525,6 @@ impl<T> Monitor<T> {
                 self.crtc_properties["MODE_ID"].handle(),
                 mode_blob,
             );
-
-            // Set CRTC active
             atomic_req.add_property(
                 self.current_crtc.handle(),
                 self.crtc_properties["ACTIVE"].handle(),
@@ -371,40 +532,36 @@ impl<T> Monitor<T> {
             );
         }
 
-        // Set framebuffer on plane (always needed)
         atomic_req.add_property(
             self.primary_plane_id,
             self.plane_properties["FB_ID"].handle(),
             property::Value::Framebuffer(Some(fb)),
         );
 
-        // Add fence for synchronization (prefer CRTC, fallback to plane)
-        if let Some(fence_prop) = self.crtc_properties.get("IN_FENCE_FD") {
-            atomic_req.add_property(
-                self.current_crtc.handle(),
-                fence_prop.handle(),
-                property::Value::SignedRange(fence_fd as i64),
-            );
-        } else if let Some(fence_prop) = self.plane_properties.get("IN_FENCE_FD") {
-            atomic_req.add_property(
-                self.primary_plane_id,
-                fence_prop.handle(),
-                property::Value::SignedRange(fence_fd as i64),
-            );
+        if let Some(in_fence_fd) = in_fence_fd {
+            // Reuse the same in-fence FD across all monitor properties in this commit.
+            // The request carries FD numbers; the caller retains ownership and closes it.
+            if let Some(fence_prop) = self.plane_properties.get("IN_FENCE_FD") {
+                atomic_req.add_property(
+                    self.primary_plane_id,
+                    fence_prop.handle(),
+                    property::Value::SignedRange(in_fence_fd as i64),
+                );
+            } else if let Some(fence_prop) = self.crtc_properties.get("IN_FENCE_FD") {
+                atomic_req.add_property(
+                    self.current_crtc.handle(),
+                    fence_prop.handle(),
+                    property::Value::SignedRange(in_fence_fd as i64),
+                );
+            }
         }
 
-        // Store buffer object, fence, and sync for next frame
-        // Buffer must stay alive until after next lock_front_buffer (double-buffering)
-        // Fence/sync cleaned up on next swap_buffers or Drop
-        self.previous_bo = Some(bo);
-        self.previous_fence_fd = Some(fence_fd);
-        self.previous_sync = Some(sync);
+        self.current_slot = (self.current_slot + 1) % self.swapchain.len();
 
-        // Update state
         self.first_frame = false;
-        self.can_render = false; // Wait for page flip event
+        self.can_render = false;
 
-        // Mark mode as set if we just did a mode set
+        drop(ctx);
         if needs_mode_set {
             self.mark_mode_set();
         }
@@ -412,208 +569,68 @@ impl<T> Monitor<T> {
         Ok(())
     }
 
-    /// Creates an EGL fence for GPU->DRM synchronization
-    /// Returns (fence_fd, sync_object)
-    pub fn create_egl_fence(&self) -> Result<(i32, *mut std::ffi::c_void), String> {
-        unsafe {
-            // Get EGL bindings from glutin display
-            let egl = self.gles_context.display().egl();
 
-            const EGL_SYNC_FENCE_KHR: u32 = 0x3144;
-
-            // Create EGL sync fence
-            let sync = egl.CreateSyncKHR(
-                egl.GetCurrentDisplay(),
-                EGL_SYNC_FENCE_KHR,
-                std::ptr::null(),
-            );
-
-            if sync.is_null() {
-                return Err("Failed to create EGL sync".to_string());
-            }
-
-            // Duplicate as a native fence FD for DRM
-            let fence_fd = egl.DupNativeFenceFDANDROID(egl.GetCurrentDisplay(), sync);
-
-            if fence_fd < 0 {
-                return Err(format!("Failed to duplicate fence FD: fence_fd={fence_fd}"));
-            }
-
-            Ok((fence_fd, sync as *mut std::ffi::c_void))
-        }
-    }
-
-    /// Destroys an EGL sync object
-    fn destroy_egl_sync(&self, sync: *mut std::ffi::c_void) {
-        unsafe {
-            // Get EGL bindings from glutin display
-            let egl = self.gles_context.display().egl();
-            let egl_display = egl.GetCurrentDisplay();
-
-            // Destroy the sync object
-            egl.DestroySyncKHR(egl_display, sync);
-        }
-    }
-
-    /// Checks if a mode set is needed (internal).
-    ///
-    /// Returns `true` if `requested_mode` differs from `current_mode`,
-    /// indicating that a mode set should be included in the next atomic commit.
     pub(crate) fn needs_mode_set(&self) -> bool {
         self.requested_mode != self.current_mode
     }
 
-    /// Marks the mode as successfully set (internal).
-    ///
-    /// Called after a successful atomic commit with mode setting.
-    /// Updates `current_mode` to match `requested_mode`.
     pub(crate) fn mark_mode_set(&mut self) {
         self.current_mode = self.requested_mode;
     }
 
-    /// Clears the current mode state (internal).
-    ///
-    /// Called when TTY focus is lost or monitor needs re-initialization.
-    /// This will trigger a mode set on the next frame.
-    ///
-    /// TODO: This will be used for TTY focus handling (SIGUSR1/SIGUSR2 signals)
     #[allow(dead_code)]
     pub(crate) fn clear_mode_state(&mut self) {
         self.current_mode = None;
-        self.first_frame = true; // Will need full mode set on next frame
+        self.first_frame = true;
     }
 
-    /// Gets a reference to the OpenGL ES bindings.
-    ///
-    /// This provides direct access to all OpenGL ES functions for this monitor.
-    /// The GL context is automatically initialized when the monitor is created.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// monitor.make_current()?;
-    /// let gl = monitor.gl();
-    /// unsafe {
-    ///     gl.ClearColor(0.0, 0.0, 0.0, 1.0);
-    ///     gl.Clear(gl::COLOR_BUFFER_BIT);
-    /// }
-    /// ```
     pub fn gl(&self) -> &crate::gl::Gles2 {
-        self.gles_context.gl()
+        &self.gl
     }
 
-    /// Gets a function pointer for loading OpenGL functions.
-    ///
-    /// This is provided for compatibility with external libraries that need
-    /// to load their own GL function pointers. Most users should use `gl()` instead.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // For use with external libraries
-    /// external_lib::load_with(|symbol| monitor.get_proc_address(symbol));
-    /// ```
     pub fn get_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
-        self.gles_context.get_proc_address(symbol)
+        self.gles_context
+            .lock()
+            .map(|ctx| ctx.get_proc_address(symbol))
+            .unwrap_or(std::ptr::null())
     }
 
-    /// Returns the DRM connector handle for this monitor.
     pub fn connector_id(&self) -> connector::Handle {
         self.connector_id
     }
 
-    /// Returns the CRTC information for this monitor.
     pub fn crtc(&self) -> &crtc::Info {
         &self.current_crtc
     }
 
-    /// Returns the optimal display mode for this monitor.
-    ///
-    /// This is the preferred mode reported by the monitor (typically the highest
-    /// resolution and refresh rate supported, e.g., 4K@120Hz).
     pub fn default_mode(&self) -> &control::Mode {
         &self.default_mode
     }
 
-    /// Returns the mode currently set in hardware.
-    ///
-    /// Returns `None` if no mode has been set yet (new monitor or after TTY focus loss).
-    /// Returns `Some(&Mode)` if a mode has been successfully committed to DRM.
-    ///
-    /// This may differ from `requested_mode()` briefly during mode transitions.
     pub fn current_mode(&self) -> Option<&control::Mode> {
         self.current_mode.as_ref()
     }
 
-    /// Returns the mode that should be used for rendering.
-    ///
-    /// Returns `None` if the optimal default mode should be used.
-    /// Returns `Some(&Mode)` if a custom mode has been requested
-    /// (e.g., downscaled to 1080p or lower refresh rate).
     pub fn requested_mode(&self) -> Option<&control::Mode> {
         self.requested_mode.as_ref()
     }
 
-    /// Sets the requested display mode for this monitor.
-    ///
-    /// This allows using a different mode than the optimal default
-    /// (e.g., lower resolution or refresh rate for compatibility).
-    ///
-    /// The mode change will take effect on the next `swap_buffers()` call
-    /// if it differs from the current hardware state.
-    ///
-    /// # Arguments
-    ///
-    /// * `mode` - The new display mode, or `None` to revert to the optimal default
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Use 1080p@60Hz instead of the default 4K@120Hz
-    /// let mode_1080p = find_mode_by_resolution(monitor, 1920, 1080);
-    /// monitor.set_mode(Some(mode_1080p));
-    ///
-    /// // Revert to optimal default
-    /// monitor.set_mode(None);
-    /// ```
     pub fn set_mode(&mut self, mode: Option<control::Mode>) {
         self.requested_mode = mode;
     }
 
-    /// Returns the effective display mode for rendering.
-    ///
-    /// This is a convenience method that returns the requested mode if set,
-    /// otherwise returns the optimal default mode.
-    ///
-    /// Use this to determine what resolution/refresh rate to render at.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let active = monitor.active_mode();
-    /// println!("Rendering at {}x{} @ {}Hz",
-    ///     active.size().0, active.size().1, active.vrefresh());
-    /// ```
     pub fn active_mode(&self) -> &control::Mode {
         self.requested_mode.as_ref().unwrap_or(&self.default_mode)
     }
 
-    /// Returns the handle to the primary plane used for scanout.
     pub fn primary_plane(&self) -> plane::Handle {
         self.primary_plane_id
     }
 
-    /// Returns the handle to the cursor plane, if available.
-    ///
-    /// Some GPUs (especially virtual ones like virtio-gpu) don't expose a separate cursor plane.
     pub fn cursor_plane(&self) -> Option<plane::Handle> {
         self.cursor_plane_id
     }
 
-    /// Returns the current resolution as (width, height).
-    ///
-    /// Uses the requested mode if one has been set, otherwise returns
-    /// the optimal default mode's resolution.
     pub fn size(&self) -> (u16, u16) {
         self.active_mode().size()
     }
@@ -621,14 +638,11 @@ impl<T> Monitor<T> {
 
 impl<T> Drop for Monitor<T> {
     fn drop(&mut self) {
-        // Clean up fence resources to prevent FD leaks
-        if let Some(fence_fd) = self.previous_fence_fd.take() {
-            unsafe {
-                libc::close(fence_fd);
+        if let Ok(ctx) = self.gles_context.lock() {
+            let _ = ctx.make_current_surfaceless();
+            for slot in &self.swapchain {
+                destroy_slot(&ctx, &self.gl, slot);
             }
-        }
-        if let Some(sync) = self.previous_sync.take() {
-            self.destroy_egl_sync(sync);
         }
     }
 }

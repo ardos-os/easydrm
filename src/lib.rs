@@ -70,8 +70,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
-use std::os::fd::{AsFd, BorrowedFd, RawFd};
+use std::ops::Deref;
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Mutex};
 
 use drm::Device;
 use drm::control::atomic::AtomicModeReq;
@@ -86,6 +88,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 use crate::card::Card;
+pub use crate::gles_context::{GlesContext, GlesContextError};
 use crate::monitor::{MonitorResourceAllocation, MonitorSetupError};
 
 mod card;
@@ -122,9 +125,15 @@ pub enum EasyDRMError {
     MonitorSetup(#[from] MonitorSetupError),
 }
 
+pub struct SwapResult {
+    pub committed_connectors: Vec<connector::Handle>,
+    pub render_fence: i32,
+}
+
 pub struct EasyDRM<T> {
     card: Card,
     gbm_device: GbmDevice<std::fs::File>,
+    shared_gles_context: Arc<Mutex<GlesContext>>,
     monitors: HashMap<connector::Handle, Monitor<T>>,
     refresh_rate_groups: HashMap<u32, Vec<connector::Handle>>, // refresh_rate -> connector handles
     fastest_group_refresh: Option<u32>,
@@ -132,7 +141,11 @@ pub struct EasyDRM<T> {
     should_update_flag: bool,
     context_constructor: Box<dyn for<'a> Fn(&MonitorContextCreationRequest<'a>) -> T + 'static>,
     uevent_socket: Option<hotplug::UEventSocket>,
+    last_fence_fd: Option<OwnedFd>
 }
+
+
+const EGL_SYNC_FENCE_KHR: u32 = 0x3144;
 
 impl<T> EasyDRM<T> {
     /// Initialize EasyDRM with a custom context constructor for each monitor
@@ -178,10 +191,14 @@ impl<T> EasyDRM<T> {
             GbmDevice::new(std::fs::File::from_raw_fd(libc::dup(fd)))
                 .expect("Failed to create GBM device")
         };
+        let shared_gles_context = Arc::new(Mutex::new(
+            GlesContext::new(&gbm_device).map_err(MonitorSetupError::GlesContextError)?,
+        ));
 
         let mut easydrm = EasyDRM {
             card,
             gbm_device,
+            shared_gles_context,
             monitors: HashMap::new(),
             refresh_rate_groups: HashMap::new(),
             fastest_group_refresh: None,
@@ -189,6 +206,7 @@ impl<T> EasyDRM<T> {
             should_update_flag: false,
             context_constructor: Box::new(context_constructor),
             uevent_socket: hotplug::UEventSocket::open().ok(),
+            last_fence_fd: None
         };
         if easydrm.uevent_socket.is_none() {
             eprintln!(
@@ -237,6 +255,7 @@ impl<T> EasyDRM<T> {
             match Monitor::setup(
                 &self.card,
                 &self.gbm_device,
+                Arc::clone(&self.shared_gles_context),
                 connector_id,
                 allocation,
                 |request| (self.context_constructor)(request),
@@ -354,6 +373,7 @@ impl<T> EasyDRM<T> {
             match Monitor::setup(
                 &self.card,
                 &self.gbm_device,
+                Arc::clone(&self.shared_gles_context),
                 connector_id,
                 allocation,
                 |request| (self.context_constructor)(request),
@@ -584,21 +604,23 @@ impl<T> EasyDRM<T> {
         Ok(())
     }
     /// Non-blocking version of [[poll_events]]
-    pub async fn poll_events_async(
-        &mut self
-    ) -> Result<(), EasyDRMError> {
+    pub async fn poll_events_async(&mut self) -> Result<(), EasyDRMError> {
         let drm_sync_fd = self.card.as_raw_fd();
         let drm_async_fd = AsyncFd::with_interest(drm_sync_fd, Interest::READABLE)?;
         let uevents_raw_fd = self.uevent_socket.as_ref().map(|s| s.fd.as_raw_fd());
         unsafe {
-
-            fcntl(drm_sync_fd, F_SETFL, fcntl(drm_sync_fd, F_GETFL)|O_NONBLOCK);
+            fcntl(
+                drm_sync_fd,
+                F_SETFL,
+                fcntl(drm_sync_fd, F_GETFL) | O_NONBLOCK,
+            );
             if let Some(fd) = uevents_raw_fd {
-                fcntl(fd, F_SETFL, fcntl(fd, F_GETFL)|O_NONBLOCK);
+                fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
             }
         }
-        let uevents_async_fd =
-            self.uevent_socket.as_ref()
+        let uevents_async_fd = self
+            .uevent_socket
+            .as_ref()
             .map(|s| AsyncFd::with_interest(s.fd.as_raw_fd(), Interest::READABLE))
             .transpose()?;
         tokio::select! {
@@ -630,6 +652,37 @@ impl<T> EasyDRM<T> {
         self.monitors.values()
     }
 
+    /// Returns a clone of the shared OpenGL ES bindings for the global EGL context.
+    pub fn gl(&self) -> Result<crate::gl::Gles2, GlesContextError> {
+        let ctx = self
+            .shared_gles_context
+            .lock()
+            .map_err(|_| GlesContextError::MakeCurrentFailed)?;
+        Ok(ctx.gl().clone())
+    }
+
+    /// Makes the shared EGL context current on the calling thread.
+    pub fn make_current(&self) -> Result<(), GlesContextError> {
+        let ctx = self
+            .shared_gles_context
+            .lock()
+            .map_err(|_| GlesContextError::MakeCurrentFailed)?;
+        ctx.make_current_surfaceless()
+    }
+
+    /// Resolves an EGL/GL symbol from the shared EGL display.
+    pub fn get_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
+        self.shared_gles_context
+            .lock()
+            .map(|ctx| ctx.get_proc_address(symbol))
+            .unwrap_or(std::ptr::null())
+    }
+
+    /// Returns a clone of the shared EGL context handle.
+    pub fn egl_context(&self) -> Arc<Mutex<GlesContext>> {
+        Arc::clone(&self.shared_gles_context)
+    }
+
     /// Get an iterator over all monitors
     pub fn monitors_mut(&mut self) -> impl Iterator<Item = &mut Monitor<T>> {
         self.monitors.values_mut()
@@ -645,38 +698,104 @@ impl<T> EasyDRM<T> {
         self.monitors.get(&connector_id)
     }
 
+    fn create_egl_fence_fd(ctx: &GlesContext) -> Result<OwnedFd, String> {
+        ctx.make_current_surfaceless()
+            .map_err(|e| format!("failed to make current context for fence creation: {e}"))?;
+        let egl = ctx.display().egl();
+        let (fence_fd, sync) = unsafe {
+            let sync = egl.CreateSyncKHR(
+                egl.GetCurrentDisplay(),
+                EGL_SYNC_FENCE_KHR,
+                std::ptr::null(),
+            );
+
+            if sync.is_null() {
+                return Err("Failed to create EGL sync".to_string());
+            }
+
+
+            let fence_fd = egl.DupNativeFenceFDANDROID(egl.GetCurrentDisplay(), sync);
+            if fence_fd < 0 {
+                egl.DestroySyncKHR(egl.GetCurrentDisplay(), sync);
+                return Err(format!("Failed to duplicate fence FD: fence_fd={fence_fd}"));
+            }
+
+            (fence_fd, sync as *mut std::ffi::c_void)
+        };
+        if !sync.is_null() {
+            unsafe{egl.DestroySyncKHR(egl.GetCurrentDisplay(), sync);}
+        }
+        if fence_fd < 0 {
+            return Err(format!("invalid fence fd: {fence_fd}"));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fence_fd) })
+    }
+
     /// Swap buffers for all monitors that were drawn to.
     ///
-    /// Each monitor that set `was_drawn = true` during this frame gets its own
-    /// `Monitor::swap_buffers()` call, which issues the atomic commit and
-    /// fence hand-off for that monitor.
-    pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
+    /// Each monitor that set `was_drawn = true` during this frame contributes
+    /// to a single atomic commit, avoiding EBUSY races with NONBLOCK commits.
+    pub fn swap_buffers_with_result(&mut self) -> Result<SwapResult, EasyDRMError> {
         let mut atomic_req = AtomicModeReq::new();
         let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
-        // Determine commit flags
-        // Rebuild the set with swapped monitors
-        let mut committed = Vec::new();
-        for (&connector_id, monitor) in self.monitors.iter_mut() {
-            if monitor.can_render() && monitor.was_drawn() {
-                if monitor.needs_mode_set() {
-              		flags |= AtomicCommitFlags::ALLOW_MODESET;
-              	}
-                monitor.swap_buffers(&self.card, &mut atomic_req)?;
-                monitor.reset_drawn_flag();
-                committed.push(connector_id);
-            }
+        let committed_connectors = self
+            .monitors
+            .iter()
+            .filter_map(|(&connector_id, monitor)| {
+                if monitor.can_render() && monitor.was_drawn() {
+                    Some(connector_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if committed_connectors.is_empty() {
+            return Ok(SwapResult {
+                committed_connectors,
+                render_fence: -1,
+            });
         }
-        let should_commit = !committed.is_empty();
-        for connector_id in committed {
+
+        self.last_fence_fd = Some({
+            let ctx = self
+                .shared_gles_context
+                .lock()
+                .map_err(|_| MonitorSetupError::DrmError("Shared GLES context poisoned".into()))?;
+            Self::create_egl_fence_fd(ctx.deref()).map_err(MonitorSetupError::DrmError)?
+        });
+        let fence_fd = self.last_fence_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+        for connector_id in committed_connectors.iter().copied() {
+            let Some(monitor) = self.monitors.get_mut(&connector_id) else {
+                continue;
+            };
+            if monitor.needs_mode_set() {
+                flags |= AtomicCommitFlags::ALLOW_MODESET;
+            }
+
+            monitor.populate_commit(&self.card, &mut atomic_req, self.last_fence_fd.as_ref().map(|f| f.as_raw_fd()))?;
+            monitor.reset_drawn_flag();
+        }
+
+        if !committed_connectors.is_empty() {
+            self
+                .card
+                .atomic_commit(flags, atomic_req)
+                .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?
+        }
+
+        for connector_id in committed_connectors.iter().copied() {
             self.mark_fast_group_commit(connector_id);
         }
 
-        // Submit atomic commit (queues the page flip, doesn't wait)
-        if should_commit {
-            self.card
-                .atomic_commit(flags, atomic_req)
-                .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?;
-        }
+        Ok(SwapResult {
+            committed_connectors,
+            render_fence: fence_fd,
+        })
+    }
+
+    pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
+        let _ = self.swap_buffers_with_result()?;
         Ok(())
     }
 
@@ -719,7 +838,10 @@ impl<T> EasyDRM<T> {
         }
     }
 
-    fn handle_drm_events(card: &mut Card, monitors: &mut HashMap<connector::Handle, Monitor<T>>) -> std::io::Result<()> {
+    fn handle_drm_events(
+        card: &mut Card,
+        monitors: &mut HashMap<connector::Handle, Monitor<T>>,
+    ) -> std::io::Result<()> {
         // Wait for events from DRM
         for event in card.receive_events()? {
             match event {
