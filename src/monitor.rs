@@ -452,7 +452,7 @@ impl<T> Monitor<T> {
             } else {
                 FbCmd2Flags::MODIFIERS
             };
-            let created = card.add_planar_framebuffer(&slot.bo, flags).map_err(|e| {
+            let created = card.add_planar_framebuffer(&slot.bo, flags).or_else(|_| card.add_framebuffer(&slot.bo, 24, 32)).map_err(|e| {
                 MonitorSetupError::DrmError(format!("Failed to add framebuffer: {}", e))
             })?;
             slot.drm_fb = Some(created);
