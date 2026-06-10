@@ -571,7 +571,7 @@ impl<T> Monitor<T> {
 
 
     pub(crate) fn needs_mode_set(&self) -> bool {
-        self.requested_mode != self.current_mode
+        self.requested_mode != self.current_mode || self.first_frame
     }
 
     pub(crate) fn mark_mode_set(&mut self) {
