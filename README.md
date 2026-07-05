@@ -27,6 +27,11 @@ loop {
     }
     easydrm.swap_buffers().unwrap();  // 2) Commit each monitor that was drawn
     easydrm.poll_events().unwrap();   // 3) Block on DRM/input events
+
+    // Alternatively you can also use the async version if you're using tokio
+    // so it doesn't block everything and allows other concurrent futures to make progress
+    // easydrm.poll_events_async().await.unwrap();   
+
     if easydrm.should_update() {      // 4) Global logic tied to fastest refresh group
         update_simulation();
     }
