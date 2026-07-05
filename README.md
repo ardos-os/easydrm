@@ -4,14 +4,77 @@ EasyDRM is a GLFW-inspired abstraction over DRM/KMS, GBM, and EGL/OpenGL that le
 
 ## Highlights
 
-- **Single-threaded & explicit**: you drive the loop, EasyDRM provides blocking events and render surfaces.
-- **Multi-monitor aware**: every monitor gets an isolated GL/EGL/GBM context, framebuffer, and fence.
+- **Single-threaded & explicit**: you drive the loop, EasyDRM provides blocking & async DRM event polling and render surfaces.
+- **Multi-monitor aware**: every monitor gets an isolated EGL buffer, framebuffer, and fence. (they still all share the same EGL context to avoid unwanted blocking when switching between them)
 - **Deterministic swap orchestration**: `swap_buffers()` walks the monitors you rendered and issues atomic commits in a predictable order.
 - **Refresh-rate aware**: monitors are grouped by refresh rate for introspection and future scheduling tweaks.
-- **3-state mode management**: `default_mode`, `requested_mode`, and `current_mode` minimize expensive modesets and handle TTY focus loss.
-- **Robust fences**: GPU→DRM synchronization prevents tearing and leaks by cleaning sync objects every frame.
+- **Robust fences**: GPU→DRM synchronization prevents tearing, making the `can_render` flag for each monitor only trip when the EGL fence for that monitor opens
+
+## What easydrm does NOT do
+
+- ❌ Handle Input Events (evdev)
+- ❌ Handle VT Switching
+
+These are outside of the scope of easydrm because it's meant to only handle graphics which is the most annoying part,
+but you can implement those things on top of easydrm using libinput and by not doing `swap_buffers` when the current tty doesn't match the initial tty.
+
+Also monitor hotplugging is still broken on `easydrm`, but that will be fixed soon hopefully.
 
 ## Core Concept
+
+A GLFW application would typically look like this:
+
+
+```C
+
+int main(void)
+{
+    if (!glfwInit())
+        exit(EXIT_FAILURE);
+ 
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+ 
+    GLFWwindow* window = glfwCreateWindow(640, 480, "OpenGL Triangle", NULL, NULL);
+    if (!window)
+    {
+        glfwTerminate();
+        exit(EXIT_FAILURE);
+    }
+    glfwMakeContextCurrent(window);
+    gladLoadGL(glfwGetProcAddress); // load opengl functions
+    glfwSwapInterval(1);
+ 
+    while (!glfwWindowShouldClose(window))
+    {
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        const float ratio = width / (float) height;
+ 
+        glViewport(0, 0, width, height);
+        glClear(GL_COLOR_BUFFER_BIT);
+        // Render here
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+ 
+    glfwDestroyWindow(window);
+ 
+    glfwTerminate();
+    exit(EXIT_SUCCESS);
+}
+ 
+```
+You have:
+- Library initialization and opening a window
+- Start a render loop
+    - Draw something with opengl
+    - Swap buffers
+    - Poll OS events
+
+`easydrm` tries to catch the same spirit as glfw, but not ignoring the nuances like having multiple monitors or explicit synchronization.
+This is how a simple application looks like:
 
 ```rust
 use easydrm::EasyDRM;
@@ -38,7 +101,10 @@ loop {
 }
 ```
 
-EasyDRM feels like a game engine main loop: you control the cadence, EasyDRM keeps hardware state in sync.
+An important difference here is that `easydrm` always behaves like glfw with `glfwSwapInterval(1)`, it always has vsync on.
+
+Also instead of blocking on swap buffers for vsync like glfw would do,
+it blocks on poll_events until it receives some event and only renders the monitors that received a page flip event (page flip meaning the frame is already on screen and the monitor is ready to be updated again).
 
 ## Architecture Overview
 
@@ -72,7 +138,8 @@ A modeset runs when `requested_mode != current_mode`, covering first boot, TTY f
 
 - Linux environment with a DRM/KMS-capable GPU (running on a VT/TTY, not under X11/Wayland).
 - Permissions to open `/dev/dri/card*` (run as root or add the user to the `video` group).
-- Rust 1.84+ (edition 2024) and a modern Mesa/GBM/EGL stack.
+- Rust 1.84+ (edition 2024)
+- a modern Mesa/GBM/EGL stack.
 
 ### Build
 
@@ -103,18 +170,3 @@ The example prints detected monitors, animates a color wipe, and keeps running u
 - `EasyDRM::should_update()` – returns true once per cycle when the fastest refresh-rate group has committed.
 
 See `examples/basic.rs` and `examples/custom_context.rs` for end-to-end loops.
-
-## Design Principles
-
-- No automatic rendering—users decide exactly when and how to render.
-- No UI toolkit logic—just buffers, events, and explicit synchronization.
-- Works with any renderer (OpenGL, Skia, Clay, custom software) as long as it can target the provided GL context.
-- Deterministic timing: a single `swap_buffers()` call per loop orchestrates every commit that needs to happen.
-
-## Roadmap
-
-- ✅ Global render loop & commit model
-- ✅ Fence strategy plus refresh-rate grouping metadata
-- ✅ 3-state display mode system
-- ✅ Complete `Monitor::swap_buffers()` implementation
-- 🚧 Cursor plane API
