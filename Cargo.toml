@@ -1,6 +1,6 @@
 [package]
 name = "easydrm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "GLFW-inspired abstraction over DRM/KMS, GBM, and EGL/OpenGL that lets you build fullscreen Linux applications without a compositor (no X11, no Wayland)."
 license = "MIT"
